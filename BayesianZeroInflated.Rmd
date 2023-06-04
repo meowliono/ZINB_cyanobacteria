@@ -1,0 +1,396 @@
+---
+title: "BayesianZeroInflated"
+author: "Yirao Zhang"
+date: "07/07/2021"
+output: html_document
+---
+## Data loading
+```{r}
+data<-read.csv("/Users/yiraozhang/Desktop/cyanobacteria_pgm/cyanobacterial-bloom-prediction/cyano&spw.csv")
+data$Cyano<-as.double(data$Cyano)
+vars <- c("DO", "ALLSKY_SFC_SW_DWN", "PRECTOT","WS10M_RANGE","pH","elev","Temp","TN","TP","Chl.a","TNTP","NONH","Turb","Fe","TKN","Spc","Bicarb","Brom","Si","NH","NO","OP","DP","FC","SSC","Cyano")
+data <- data[vars]
+colnames(data)<-c("DO", "Solar_radiation", "Precipitation","Wind","pH","Elevation","Temp","TN","TP","Chl.a","TNTP","NONH","Turb","Fe","TKN","Spc","Bicarb","Brom","Si","NH","NO","OP","DP","FC","SSC","Cyano")
+data
+```
+##Normalize
+```{r}
+normalize <- function(x) {
+return ((x - min(x)) / (max(x) - min(x)))
+}
+Cyano<-data$Cyano
+df <- subset(data, select = -c(Cyano))
+df<-apply(df, 2, normalize)
+data<-as.data.frame(cbind(df,Cyano))
+data
+```
+## Stratified random sampling
+```{r}
+library(caTools)
+data$Cyano[data$Cyano==1] <- 0
+data_0<-data[data$Cyano==0,]
+data_1<-data[which(data$Cyano!=0),]
+sample_size_0 = floor(0.8*nrow(data_0))
+sample_size_1 = floor(0.8*nrow(data_1))
+set.seed(777)
+picked_0 = sample(seq_len(nrow(data_0)),size = sample_size_0)
+train_0 =data_0[picked_0,]
+test_0 =data_0[-picked_0,]
+picked_1 = sample(seq_len(nrow(data_1)),size = sample_size_1)
+train_1 =data_1[picked_1,]
+test_1 =data_1[-picked_1,]
+train <- rbind(train_0, train_1)
+test <- rbind(test_0, test_1)
+```
+## Data visualization
+```{r}
+library(ggplot2)
+ggplot(data, aes(x=Cyano)) + 
+  geom_histogram(color="black", fill="white", binwidth = 2000) +
+  xlab("cyanobacteria abundance")
+```
+##Variable selection
+```{r}
+library(projpred)
+library(rstanarm)
+vs <- rstanarm::stan_glm(Cyano ~ pH + Temp+ Solar_radiation+ Chl.a+ Precipitation+ Wind+ TN + TP+ Turb, chains = 2,  data = train, seed = 1)
+library(bayesplot)
+ref <- get_refmodel(vs)
+vs <- varsel(ref)
+vs_stats = data.frame(summary(vs, stats=c("elpd", "rmse"))$selection)
+levels(vs_stats$solution_terms) <- c(levels(vs_stats$solution_terms), 'Intercept') 
+vs_stats[1,2] = 'Intercept'
+vs_stats$solution_terms <- factor(vs_stats$solution_terms, 
+                                  levels = vs_stats$solution_terms[order(vs_stats$elpd)]) 
+ymx_elpd = unlist(vs_stats['elpd'] + vs_stats['elpd.se'])
+ymn_elpd = unlist(vs_stats['elpd'] - vs_stats['elpd.se'])
+ggplot(vs_stats, aes(x=solution_terms, y=elpd, group=1)) +
+  theme(text = element_text(size=15))+
+  geom_line(size=0.5, linetype=3) +
+  geom_point(shape=21, size=3, fill='black') +
+  geom_errorbar(aes(x = solution_terms, ymax=ymx_elpd, ymin=ymn_elpd), width=0.2, size=0.5) +
+  labs(x = "Variable", y = "elpd value")
+ymx_rmse = unlist(vs_stats['rmse'] + vs_stats['rmse.se'])
+ymn_rmse= unlist(vs_stats['rmse'] - vs_stats['rmse.se'])
+ggplot(vs_stats, aes(x=solution_terms, y=rmse, group=1)) +
+  theme(text = element_text(size=15)) +
+  geom_line(size=0.5, linetype=3) +
+  geom_point(shape=21, size=3, fill='black') +
+  geom_errorbar(aes(x = solution_terms, ymax=ymx_rmse, ymin=ymn_rmse), width=0.2, size=0.5) +
+  labs(x = "Variable", y = "rmse value")
+```
+## Parameter Estimation --Bayesian Approach
+```{r}
+library(dplyr)
+library(magrittr)
+library(rstan)
+x<-train %>% select(TP, Solar_radiation, Turb, Temp, Chl.a)
+x_test<-test%>%select(TP, Solar_radiation, Turb, Temp, Chl.a)
+stan_data <- list(N=nrow(x),
+                  K=ncol(x),
+                  x=x,
+                  y=train$Cyano,
+                  N_test=nrow(x_test),
+                  x_test=x_test)
+```
+```{r}
+## Ordinary NB
+fit_NB <- stan(file = 'NB.stan', data = stan_data, iter = 1000, chains = 4)
+traceplot(fit_NB, pars=c("intercept","phi","beta_mu[1]","beta_mu[2]","beta_mu[3]","beta_mu[4]","beta_mu[5]"))
+```
+```{r}
+## Ordinary NB
+## increase the number of iterations
+fit_NB <- stan(file = 'NB.stan', data = stan_data, iter = 5000, warmup = 1000, chains = 4)
+traceplot(fit_NB, pars=c("intercept","phi","beta_mu[1]","beta_mu[2]","beta_mu[3]","beta_mu[4]","beta_mu[5]"))
+```
+```{r}
+## ZINB
+fit_ZINB <- stan(file = 'ZINB.stan', data = stan_data, iter = 1000, chains = 4)
+traceplot(fit_ZINB, pars=c("intercept1","intercept2","phi","beta_theta[1]","beta_theta[2]","beta_theta[3]","beta_theta[4]","beta_theta[5]","beta_mu[1]"))
+traceplot(fit_ZINB, pars=c("beta_mu[2]","beta_mu[3]","beta_mu[4]","beta_mu[5]"))
+```
+```{r}
+## ZINB
+## increase iterations 
+fit_ZINB <- stan(file = 'ZINB.stan', data = stan_data, iter = 5000, warmup = 1000, chains = 4)
+traceplot(fit_ZINB, pars=c("intercept1","intercept2","phi","beta_theta[1]","beta_theta[2]","beta_theta[3]","beta_theta[4]","beta_theta[5]","beta_mu[1]"))
+traceplot(fit_ZINB, pars=c("beta_mu[2]","beta_mu[3]","beta_mu[4]","beta_mu[5]"))
+```
+```{r}
+## Hurdle NB
+fit_hNB <-stan(file = 'hurdle_NB.stan', data = stan_data, iter = 1000, warmup = 500, chains = 4)
+traceplot(fit_hNB,pars=c("intercept1","intercept2","phi","beta_theta[1]","beta_theta[2]","beta_theta[3]","beta_theta[4]","beta_theta[5]","beta_mu[1]"))
+traceplot(fit_hNB, pars=c("beta_mu[2]","beta_mu[3]","beta_mu[4]","beta_mu[5]"))
+```
+```{r}
+## Hurdle NB
+## increase iterations
+fit_hNB <-stan(file = 'hurdle_NB.stan', data = stan_data, iter = 5000, warmup = 1000, chains = 4)
+traceplot(fit_hNB,pars=c("intercept1","intercept2","phi","beta_theta[1]","beta_theta[2]","beta_theta[3]","beta_theta[4]","beta_theta[5]","beta_mu[1]"))
+traceplot(fit_hNB, pars=c("beta_mu[2]","beta_mu[3]","beta_mu[4]","beta_mu[5]"))
+```
+## Model Selection --Leave One Out Cross Validation
+```{r}
+library("loo")
+#NB
+log_lik_1 <- extract_log_lik(fit_NB, merge_chains = FALSE)
+loo_1 <- loo(log_lik_1, cores = 2)
+
+#ZINB
+log_lik_2 <- extract_log_lik(fit_ZINB, merge_chains = FALSE)
+r_eff_2 <- relative_eff(exp(log_lik_2))
+loo_2 <- loo(log_lik_2, r_eff = r_eff_2, cores = 2)
+#Hurdle NB
+log_lik_3 <- extract_log_lik(fit_hNB, merge_chains = FALSE)
+r_eff_3 <- relative_eff(exp(log_lik_3))
+loo_3 <- loo(log_lik_3, r_eff = r_eff_3, cores = 2)
+```
+
+## Model Evaluation --Posterior Predictive Checks
+```{r}
+traceplot(fit_ZINB, inc_warmup = FALSE)
+plot(fit_ZINB)
+pars.name = c("intercept1","intercept2","phi","beta_theta[1]","beta_mu[2]","beta_mu[3]","beta_mu[4]","beta_mu[5]")
+#TN, Solar_radiation, Turb, Temp, Chl.a
+stan_dens(fit_ZINB, pars= pars.name)
+```
+```{r}
+stan_data <- list(N=nrow(x),
+                  K=ncol(x),
+                  x=x,
+                  y=train$Cyano,
+                  y1=train$Cyano,
+                  N_test=nrow(x_test),
+                  x_test=x_test)
+fit_rep<-stan(file = 'ZINB_quantities_rep.stan', data = stan_data, iter = 1000, chains = 4)
+```
+```{r}
+library(bayesplot)
+library(ggplot2)
+y_rep <- as.matrix(fit_rep, pars = "y_rep")
+color_scheme_set("brightblue")
+ppc_dens_overlay(train$Cyano, y_rep[1:200, ])+ xlim(0, 100000)
+```
+```{r}
+indicator_summary <- summary(fit_rep, pars = c("indicator1","indicator2"), probs = c(0.1, 0.9))$summary
+print(indicator_summary)
+```
+```{r}
+ppc_stat(y = train$Cyano, yrep = y_rep, stat = "mean") + xlim(0, 100000)
+prop_zero <- function(x) mean(x == 0)
+ppc_stat(y = train$Cyano, yrep = y_rep, stat = "prop_zero") + xlim(0, 1)
+```
+## Cyanobacteria Abundance Prediction
+```{r}
+library(berryFunctions)
+library(Metrics)
+predict2<-as.data.frame(apply(y_rep, 2, median))
+colnames(predict2)<-c("Cyano")
+rsq2<-rsquare(predict2$Cyano, test$Cyano)
+```
+```{r}
+loadhistory("codedisplay.Rhistory")
+```
+
+```{r}
+data
+data$Cyano[data$Cyano==1] <- 0
+x<-data %>% select(TP, Solar_radiation, pH, Temp, Chl.a)
+stan_data <- list(N=nrow(x),
+                  K=ncol(x),
+                  x=x,
+                  y=data$Cyano,
+                  y1=data$Cyano)
+fit_rep <- stan(file = 'ZINB_quantities_rep.stan', data = stan_data, iter = 1000, chains = 4)
+indicator_summary <- summary(fit_rep, pars = c("indicator1","indicator2"), probs = c(0.1, 0.9))$summary
+print(indicator_summary)
+```
+```{r}
+set.seed(101)
+library(caret)
+flds <- createFolds(data$Cyano, k = 5, list = TRUE, returnTrain = FALSE)
+```
+```{r}
+library(rstan)
+train<- data[-flds[[5]],]
+test <-data[flds[[5]],]
+train$Cyano[train$Cyano==1] <- 0
+test$Cyano[test$Cyano==1] <- 0
+x<-train %>% select(TP, Solar_radiation, Turb, Temp, Chl.a)
+x_test<-test%>%select(TP, Solar_radiation, Turb, Temp, Chl.a)
+stan_data <- list(N=nrow(x),
+                  K=ncol(x),
+                  x=x,
+                  y=train$Cyano,
+                  N_test=nrow(x_test),
+                  y1=test$Cyano,
+                  x_test=x_test)
+fit_ZINB <- stan(file = 'ZINB_quantities.stan', data = stan_data, iter = 1000, chains = 4)
+indicator_summary <- summary(fit_ZINB, pars = c("indicator1","indicator2"), probs = c(0.1, 0.9))$summary
+print(indicator_summary)
+```
+```{r}
+stan_data <- list(N=nrow(x),
+                  K=ncol(x),
+                  x=x,
+                  y=train$Cyano,
+                  y1=test$Cyano,
+                  N_test=nrow(x_test),
+                  x_test=x_test)
+fit_pre <- stan(file = 'ZINB_quantities.stan', data = stan_data, iter = 1000, chains = 4)
+```
+```{r}
+y_pre <- as.matrix(fit_pre, pars = "y_pre")
+library(tidyverse)
+iterations<-c(1:2000)
+df<-as.data.frame(y_pre)
+df$iterations<-iterations
+head(df)
+categories<-df %>% 
+  pivot_longer(-iterations, names_to = "vars", values_to="groups") %>%
+  mutate(groups=cut(groups,breaks=c(-Inf,500, 2000, 6500, 65000, Inf), 
+      labels=c("safe","low","medium","high","veryhigh"))) %>%
+  pivot_wider(names_from = vars, values_from = groups)
+categories$iterations<-NULL
+categories
+Mode <- function(x) {
+  if(length(which(x=="safe"))/length(x)>0.436291){
+    return("safe")
+  }
+  ux <- c("low","medium","high","veryhigh")
+  ux[which.max(tabulate(match(x, ux)))]
+}
+predictions <- apply(categories, 2, Mode)
+predictions
+test$category<-"safe"
+test$category[test$Cyano>=500&test$Cyano<2000] <- "low"
+test$category[test$Cyano>=2000&test$Cyano<6500] <- "medium"
+test$category[test$Cyano>=6500&test$Cyano<=65000] <- "high"
+test$category[test$Cyano>=65000] <- "veryhigh"
+table(test$category, predictions)
+accuracy <- mean(test$category == predictions)
+accuracy
+```
+```{r}
+y_rep <- as.matrix(fit_rep, pars = "y_rep")
+library(tidyverse)
+library(dplyr)
+iterations<-c(1:2000)
+df<-as.data.frame(y_rep)
+df$iterations<-iterations
+categories<-df %>% 
+  pivot_longer(-iterations, names_to = "vars", values_to="groups") %>%
+  mutate(groups=cut(groups,breaks=c(-Inf,500, 2000, 6500, 65000, Inf), 
+      labels=c("safe","low","medium","high","veryhigh"))) %>%
+  pivot_wider(names_from = vars, values_from = groups)
+categories$iterations<-NULL
+frequency <- function(x) {
+  u <-c("safe","low","medium","high","veryhigh")
+  matched<-match(x, u)
+  tabulate(matched)/length(x)
+}
+mode <- function(x) {
+  ux <- unique(x)
+  ux[which.max(tabulate(match(x, ux)))]
+}
+predictions_mode <- apply(categories, 2, mode)
+predictions_freq <- apply(categories, 2, frequency)
+train$category<-"safe"
+train$category[train$Cyano>=500&train$Cyano<2000] <- "low"
+train$category[train$Cyano>=2000&train$Cyano<6500] <- "medium"
+train$category[train$Cyano>=6500&train$Cyano<=65000] <- "high"
+train$category[train$Cyano>=65000] <- "veryhigh"
+percentage <-function(label, train, mode, frequency){
+  index<-c()
+  percentage<-0
+  u <-c("safe","low","medium","high","veryhigh")
+  for (i in c(1:147)){
+    if (train$category[i] == predictions_mode[i]&train$category == label){
+     index <- c(index, i)}
+  }
+  for (j in index) {
+    percentage <- percentage+predictions_freq[[j]][match(label,u)]
+  }
+  return(percentage/length(index))
+}
+```
+
+```{r}
+library(tidyverse)
+library(dbplyr)
+library(rstan)
+library(caTools)
+set.seed(101)
+#Split the data into zero and non-zero subgroups
+data_0<-data[data$Cyano==0,]
+data_1<-data[which(data$Cyano!=0),]
+#Random sampling from the two subgroups and create 5 cross validation folds
+data_0<-data_0[sample(nrow(data_0)),]
+data_1<-data_1[sample(nrow(data_1)),]
+folds_0 <- cut(seq(1,nrow(data_0)),breaks=5,labels=FALSE)
+folds_1 <- cut(seq(1,nrow(data_1)),breaks=5,labels=FALSE)
+#Perform 5 fold cross validation
+#Function for mode calculation
+Mode <- function(x) {
+  if(length(which(x=="safe"))/length(x)>0.436291){
+    return("safe")
+  }
+  ux <- c("low","medium","high","veryhigh")
+  ux[which.max(tabulate(match(x, ux)))]
+}
+accuracy<-c(1:5)
+for(i in 1:5){
+  testIndexes_0 <- which(folds_0==i,arr.ind=TRUE)
+  test_0 <- data_0[testIndexes_0, ]
+  train_0 <- data_0[-testIndexes_0, ]
+  testIndexes_1 <- which(folds_1==i,arr.ind=TRUE)
+  test_1 <- data_1[testIndexes_1, ]
+  train_1 <- data_1[-testIndexes_1, ]
+  train <- rbind(train_0, train_1)
+  test <- rbind(test_0, test_1)
+  x<-train %>% select(TP, Solar_radiation, pH, Temp, Chl.a)
+  x_test<-test%>%select(TP, Solar_radiation, pH, Temp, Chl.a)
+  stan_data <- list(N=nrow(x),
+                  K=ncol(x),
+                  x=x,
+                  y=train$Cyano,
+                  N_test=nrow(x_test),
+                  y1=test$Cyano,
+                  x_test=x_test)
+  fit_ZINB <- stan(file = 'ZINB_quantities.stan', data = stan_data, iter = 1000, chains = 4)
+  ##
+  y_pre <- as.matrix(fit_pre, pars = "y_pre")
+  iterations<-c(1:2000)
+  df<-as.data.frame(y_pre)
+  df$iterations<-iterations
+  categories<-df %>% pivot_longer(-iterations, names_to = "vars", values_to="groups") %>%
+  mutate(groups=cut(groups,breaks=c(-Inf,500, 2000, 6500, 65000, Inf), 
+      labels=c("safe","low","medium","high","veryhigh"))) %>%
+  pivot_wider(names_from = vars, values_from = groups)
+  categories$iterations<-NULL
+  predictions <- apply(categories, 2, Mode)
+  test$category<-"safe"
+  test$category[test$Cyano>=500&test$Cyano<2000] <- "low"
+  test$category[test$Cyano>=2000&test$Cyano<6500] <- "medium"
+  test$category[test$Cyano>=6500&test$Cyano<=65000] <- "high"
+  test$category[test$Cyano>=65000] <- "veryhigh"
+  accuracy[i] <- mean(test$category == predictions)
+}
+```
+## Sensitivity Analysis
+```{r}
+#original
+fit_ZINB<-stan(file = 'ZINB.stan', data = stan_data, iter = 5000, warmup = 1000, chains = 4)
+```
+```{r}
+#change priors to weakly informative
+fit_prior1<-stan(file = 'ZINB_changepriors1.stan', data = stan_data, iter = 8000, warmup = 4000, chains = 4)
+#change priors to diffuse 
+fit_prior2<-stan(file = 'ZINB_changepriors2.stan', data = stan_data, iter = 8000, warmup = 4000, chains = 4)
+```
+```{r}
+mean_original<-summary(fit_ZINB, pars=c("intercept1","intercept2","phi","beta_theta[1]","beta_theta[2]","beta_theta[3]","beta_theta[4]","beta_theta[5]","beta_mu[1]","beta_mu[2]","beta_mu[3]","beta_mu[4]","beta_mu[5]"))$summary[,'mean']
+mean_prior1<-summary(fit_prior1, pars=c("intercept1","intercept2","phi","beta_theta[1]","beta_theta[2]","beta_theta[3]","beta_theta[4]","beta_theta[5]","beta_mu[1]","beta_mu[2]","beta_mu[3]","beta_mu[4]","beta_mu[5]"))$summary[,'mean']
+mean_prior2<-summary(fit_prior2, pars=c("intercept1","intercept2","phi","beta_theta[1]","beta_theta[2]","beta_theta[3]","beta_theta[4]","beta_theta[5]","beta_mu[1]","beta_mu[2]","beta_mu[3]","beta_mu[4]","beta_mu[5]"))$summary[,'mean']
+```
